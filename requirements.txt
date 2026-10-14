@@ -1,0 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+streamlit==1.50.0
+torch==2.7.1+cpu ; sys_platform == "linux"
+torch==2.7.1 ; sys_platform != "linux"
+torch-geometric==2.6.1
+rdkit==2024.3.5
+numpy==1.24.4
+pandas==1.5.3
+networkx==2.6.3
+pyarrow==17.0.0

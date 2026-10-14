@@ -1,0 +1,32 @@
+{
+  "passed": [
+    "initial UI loads with all 10 tasks",
+    "example button performs real inference and renders results",
+    "separate session does not see earlier user result",
+    "task selection resets old results and exports selected task",
+    "upload mode requires all input files and clears old results"
+  ],
+  "checkpoint_sha256": "71a099d9eaa2f079a10d69a98e21c5c07f3ff2c500e23f3779df9f79342263e3",
+  "engine_checks": [
+    "CPU scores match reference within 2e-5",
+    "one-task CSV export",
+    "incorrect fingerprint IDs rejected"
+  ],
+  "local_test_environment": {
+    "python": "3.10",
+    "torch": "2.7.1+cu128 running CPU inference",
+    "streamlit": "1.50.0",
+    "pyarrow": "17.0.0"
+  },
+  "target_environment": {
+    "python": "3.11",
+    "os": "Linux",
+    "torch": "2.7.1+cpu"
+  },
+  "not_verified": [
+    "Community Cloud Linux build",
+    "public deployment URL",
+    "concurrent load capacity",
+    "visual browser screenshot review"
+  ]
+}
