@@ -27,6 +27,11 @@ def initialize():
 
 def clear_result():
     st.session_state.pop('prediction_result',None)
+    st.session_state.pop('prediction_payload',None)
+    clear_analysis()
+
+def clear_analysis():
+    st.session_state.pop('fingerprint_analysis',None)
 
 def encode_file(file):
     return {'name':file.name,'b64':base64.b64encode(file.getvalue()).decode('ascii')}
@@ -88,6 +93,7 @@ if st.button('开始预测',type='primary',disabled=not ready):
             with st.spinner('正在检查文件、构建分子图并预测，请稍候…'):
                 result=engine.run_predict(payload)
             st.session_state['prediction_result']=result
+            st.session_state['prediction_payload']=payload
         except ValueError as exc:
             st.error(str(exc))
         except Exception:
@@ -111,6 +117,47 @@ if result:
         with st.expander('查看无法预测的记录'):
             st.dataframe(pd.DataFrame(result['failures']),width='stretch',hide_index=True)
     st.caption('结果只存放在当前会话中；清除结果、刷新连接或应用重启后可能丢失，请及时下载。')
+
+    st.subheader('3 · 指纹影响分析')
+    st.write('选择一个分子和预测方向，分别将一种指纹的输入全部置零，比较预测分数。其余输入保持不变。')
+    st.caption('这是零基线屏蔽敏感性分析，不是门控权重或贡献百分比。指纹之间可能包含重叠信息；全零输入也可能偏离真实数据分布。')
+    valid_rows=table.loc[table.status.eq('ok'),'source_row_zero_based'].astype(int).tolist()
+    if valid_rows and st.session_state.get('prediction_payload'):
+        smiles_by_row=table.set_index('source_row_zero_based')['smiles'].to_dict()
+        row=st.selectbox('选择要分析的分子',valid_rows,
+            format_func=lambda r:f'第 {r+1} 个分子 · {smiles_by_row[r]}',
+            key='analysis_row',on_change=clear_analysis)
+        task=st.selectbox('选择要分析的毒性方向',selected,
+            format_func=lambda t:LABELS.get(t,t),key='analysis_task',on_change=clear_analysis)
+        if st.button('分析指纹影响'):
+            clear_analysis()
+            acquired=engine.INFERENCE_LOCK.acquire(blocking=False)
+            if not acquired:
+                st.warning('目前另一个预测或分析正在计算，请稍后再次点击。')
+            else:
+                try:
+                    with st.spinner('正在进行原始预测及四次指纹屏蔽实验…'):
+                        analysis=engine.analyze_fingerprints(st.session_state['prediction_payload'],row,task)
+                    st.session_state['fingerprint_analysis']=analysis
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception:
+                    st.error('分析未完成，请稍后重试或联系部署者检查日志。')
+                finally:
+                    engine.INFERENCE_LOCK.release()
+        analysis=st.session_state.get('fingerprint_analysis')
+        if analysis and analysis['row']==row and analysis['task']==task:
+            st.metric('该分子的原始模型分数',f"{analysis['baseline']:.6f}")
+            impact=pd.DataFrame(analysis['records'])
+            delta='分数变化（原始−屏蔽）'
+            st.bar_chart(impact.set_index('指纹')[[delta]],horizontal=True)
+            st.caption('正值：屏蔽后分数下降；负值：屏蔽后分数上升。绝对值越大，模型对该次屏蔽越敏感。接近零不代表该指纹完全无用。四项变化不相加为总分。')
+            st.dataframe(impact,width='stretch',hide_index=True,
+                column_config={c:st.column_config.NumberColumn(format='%.6f') for c in ['原始分数','屏蔽后分数',delta]})
+            st.download_button('下载指纹影响分析 CSV',impact.to_csv(index=False).encode('utf-8-sig'),
+                f'fingerprint_impact_row_{row+1}.csv','text/csv')
+    else:
+        st.info('没有可供分析的有效分子，请先完成一次成功预测。')
 
 with st.expander('模型说明与既有留出集指标'):
     st.write('该权重基于 2022 条有效记录训练，训练/验证/测试为 1416/303/303。按标准化分子分组划分，最佳权重和阈值只根据验证集选择。')

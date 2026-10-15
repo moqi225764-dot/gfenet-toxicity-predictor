@@ -124,6 +124,49 @@ def build_fingerprints(files: dict, n: int):
         arrays.append(np.divide(x, sums, out=np.zeros_like(x), where=sums != 0))
     return arrays, warnings
 
+def analyze_fingerprints(payload: dict, row: int, task: str) -> dict:
+    """Single-row input-zero ablation; caller holds INFERENCE_LOCK.
+
+    This is sensitivity to a zero baseline, not gate weights or causal attribution.
+    Never mutate the original payload or shared model.
+    """
+    if task not in _state['task_names']:
+        raise ValueError('未知预测任务')
+    frame = _read_csv_bytes(base64.b64decode(payload['csv']['b64']))
+    if not 0 <= row < len(frame) or len(frame) > MAX_ROWS:
+        raise ValueError('分子行号超出范围')
+    build_fingerprints(payload['fingerprints'], len(frame))
+    def encode(frame):
+        return {'b64': base64.b64encode(frame.to_csv(index=False).encode('utf-8')).decode('ascii')}
+    single = {'csv': encode(frame.iloc[[row]]), 'fingerprints': {}, 'tasks': [task]}
+    pieces = {}
+    for key, _, _ in FINGERPRINTS:
+        fp = _read_csv_bytes(base64.b64decode(payload['fingerprints'][key]['b64'])).iloc[[row]].copy()
+        if 'Name' in fp:
+            fp['Name'] = 'AUTOGEN_smi_1'
+        pieces[key] = fp
+        single['fingerprints'][key] = encode(fp)
+    def score(data):
+        result = run_predict(data)
+        if result['summary']['ok'] != 1:
+            raise ValueError('该分子无法预测，不能进行指纹分析')
+        return float(pd.read_csv(io.BytesIO(result['csv_bytes']))[task + '_probability'].iloc[0])
+    baseline = score(single)
+    records = []
+    for key, label, _ in FINGERPRINTS:
+        masked = pieces[key].copy()
+        cols = [c for c in masked if c != 'Name']
+        masked.loc[:, cols] = 0
+        altered = {**single, 'fingerprints': {**single['fingerprints'], key: encode(masked)}}
+        value = score(altered)
+        delta = baseline - value
+        records.append({'分子序号': row + 1, '任务': task, '指纹': label,
+                        '原始分数': baseline, '屏蔽后分数': value,
+                        '分数变化（原始−屏蔽）': delta})
+    return {'row': row, 'task': task, 'baseline': baseline, 'records': records,
+            'method': 'input_zero_ablation'}
+
+
 def run_predict(payload: dict) -> dict:
     """执行预测，返回可直接 JSON 化的结果结构。"""
     t0 = time.time()

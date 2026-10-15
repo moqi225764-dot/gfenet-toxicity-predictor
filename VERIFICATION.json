@@ -28,5 +28,15 @@
     "public deployment URL",
     "concurrent load capacity",
     "visual browser screenshot review"
-  ]
+  ],
+  "fingerprint_analysis_checks": [
+    "four input-zero masks match independently masked batch within 2e-5",
+    "original inputs and predictions unchanged",
+    "non-first input row matched",
+    "task change resets analysis",
+    "separate sessions isolated",
+    "clear removes payload and analysis",
+    "Streamlit AppTest render and download control passed"
+  ],
+  "fingerprint_analysis_online_update_verified": false
 }
