@@ -1,5 +1,9 @@
-"""Portable CPU inference; no shared upload/result storage."""
-import base64, io, json, time, threading
+"""Portable CPU inference with automatic PaDEL fingerprint generation.
+
+用户只上传分子 CSV；四类指纹在服务端用 PaDEL-Descriptor v2.21 默认参数生成。
+生成出的指纹与训练时使用的四类指纹逐位一致（见实验对照记录）。
+"""
+import base64, io, json, os, shutil, subprocess, tempfile, time, threading
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -11,10 +15,12 @@ from model import GFE
 from features import smiletopyg
 RDLogger.DisableLog('rdApp.*')
 ROOT=Path(__file__).resolve().parent
-CHECKPOINT=ROOT/'assets/gfenet_best.pt'
-QM9_LOOKUP=ROOT/'assets/qm9_lookup.json'
-METRICS_CSV=ROOT/'assets/test_metrics.csv'
-EXAMPLE_DIR=ROOT/'example'
+CHECKPOINT=Path(os.environ.get('GFENET_CHECKPOINT', ROOT/'assets/gfenet_best.pt'))
+QM9_LOOKUP=Path(os.environ.get('GFENET_QM9', ROOT/'assets/qm9_lookup.json'))
+METRICS_CSV=Path(os.environ.get('GFENET_METRICS', ROOT/'assets/test_metrics.csv'))
+EXAMPLE_DIR=Path(os.environ.get('GFENET_EXAMPLE', ROOT/'example'))
+PADEL_JAR=Path(os.environ.get('PADEL_JAR', ROOT/'padel/PaDEL-Descriptor.jar'))
+PADEL_XML=Path(os.environ.get('PADEL_XML', ROOT/'padel/fp4.xml'))
 FINGERPRINTS=[('pubchem','PubChemFP（881 维）',881),('graph','GraphFP（1024 维）',1024),('apc2d','APC2D（780 维）',780),('fp1024','FP1024（1024 维）',1024)]
 BATCH_SIZE=8
 MAX_ROWS=50
@@ -86,43 +92,87 @@ def task_config() -> list:
         })
     return out
 
-def build_fingerprints(files: dict, n: int):
-    """校验并归一化四类指纹，严格复刻训练脚本的处理方式。"""
-    arrays, warnings = [], []
-    for key, label, width in FINGERPRINTS:
-        item = files.get(key)
-        if not item or not item.get('b64'):
-            raise ValueError(f'缺少 {label} 指纹文件')
-        try:
-            raw = base64.b64decode(item['b64'])
-        except Exception:
-            raise ValueError(f'{label} 文件内容无法解码')
-        try:
-            df = _read_csv_bytes(raw)
-        except Exception as exc:
-            raise ValueError(f'{label} 无法解析为 CSV：{exc}')
+def _java_path() -> str:
+    """定位 Java：环境变量 PADEL_JAVA > 常见本机运行时 > PATH。"""
+    for candidate in (os.environ.get('PADEL_JAVA'),
+                      r'C:\Program Files\JetBrains\PyCharm 2025.3.2\jbr\bin\java.exe'):
+        if candidate and Path(candidate).is_file():
+            return candidate
+    found = shutil.which('java')
+    if found:
+        return found
+    raise ValueError('未找到 Java 运行时：请安装 JRE，或设置环境变量 PADEL_JAVA 指向 java.exe')
 
-        if 'Name' in df.columns:
-            names = df['Name'].astype(str).tolist()
-            expect = [f'AUTOGEN_smi_{i + 1}' for i in range(n)]
-            if names != expect:
-                raise ValueError(f'{label} 的 Name 必须按 AUTOGEN_smi_1..{n} 排列，请核对分子与指纹行顺序。')
-            df = df.drop(columns=['Name'])
+def _padel_columns(columns, prefix: str, width: int, label: str) -> list:
+    cols = [c for c in columns if str(c).startswith(prefix) and c != 'Name']
+    if len(cols) != width:
+        raise ValueError(f'PaDEL 输出的 {label} 维度异常：期望 {width}，实际 {len(cols)}')
+    return cols
 
-        try:
-            x = df.to_numpy(dtype=np.float32)
-        except (ValueError, TypeError):
-            raise ValueError(f'{label} 包含非数值内容，指纹必须全部为数值列')
-        if x.shape != (n, width):
-            raise ValueError(
-                f'{label} 维度应为 {n} 行 × {width} 列，实际为 {x.shape[0]} 行 × {x.shape[1]} 列'
-                f'（行数需与分子 CSV 一致）')
-        if not np.isfinite(x).all():
-            raise ValueError(f'{label} 存在 NaN 或 Inf 数值')
+def generate_fingerprints(smiles: list) -> tuple:
+    """用 PaDEL-Descriptor v2.21 默认参数生成四类指纹。
 
-        sums = x.sum(1, keepdims=True)
-        arrays.append(np.divide(x, sums, out=np.zeros_like(x), where=sums != 0))
-    return arrays, warnings
+    返回 (arrays, failed, elapsed)。arrays 按 FINGERPRINTS 顺序、已完成行和归一化；
+    failed 为 {行号: 原因}。临时目录用后删除，不覆盖任何原指纹文件。
+    """
+    n = len(smiles)
+    if n == 0:
+        return [np.zeros((0, w), dtype=np.float32) for _, _, w in FINGERPRINTS], {}, 0.0
+    if not PADEL_JAR.is_file():
+        raise ValueError(f'缺少 PaDEL 程序：{PADEL_JAR}')
+    if not PADEL_XML.is_file():
+        raise ValueError(f'缺少 PaDEL 指纹配置：{PADEL_XML}')
+
+    t0 = time.time()
+    work = Path(tempfile.mkdtemp(prefix='gfenet_padel_'))
+    try:
+        in_dir = work / 'in'
+        in_dir.mkdir()
+        # 不写分子名 -> PaDEL 生成 AUTOGEN_smi_1..N，与训练指纹的命名规则一致
+        (in_dir / 'smi.smi').write_text('\n'.join(smiles) + '\n', encoding='utf-8')
+        out_csv = work / 'out.csv'
+        cmd = [_java_path(), '-Xmx512m', '-jar', str(PADEL_JAR), '-fingerprints',
+               '-descriptortypes', str(PADEL_XML), '-dir', str(in_dir),
+               '-file', str(out_csv), '-retainorder']
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if not out_csv.is_file():
+            detail = (proc.stdout + proc.stderr).strip()[-500:]
+            raise ValueError(f'PaDEL 未生成输出文件：{detail}')
+        out = pd.read_csv(out_csv)
+        name_col = 'Name' if 'Name' in out.columns else out.columns[0]
+        out = out.set_index(name_col)
+
+        prefix_map = {'pubchem': 'PubchemFP', 'graph': 'GraphFP',
+                      'apc2d': 'AD2D', 'fp1024': 'FP'}
+        arrays, failed = [], {}
+        for key, label, width in FINGERPRINTS:
+            cols = _padel_columns(out.columns, prefix_map[key], width, label)
+            x = np.zeros((n, width), dtype=np.float32)
+            for i in range(n):
+                # 多分子时 PaDEL 命名为 AUTOGEN_smi_1..N；单分子时省略序号
+                names = [f'AUTOGEN_smi_{i + 1}'] + (['AUTOGEN_smi'] if n == 1 else [])
+                name = next((x for x in names if x in out.index), None)
+                if name is None:
+                    failed.setdefault(i, 'PaDEL 未返回该分子的指纹')
+                    continue
+                vals = pd.to_numeric(out.loc[name, cols], errors='coerce').to_numpy(dtype=np.float32)
+                if not np.isfinite(vals).all():
+                    failed.setdefault(i, f'{label} 指纹含缺失或非数值')
+                    continue
+                x[i] = vals
+            sums = x.sum(1, keepdims=True)
+            arrays.append(np.divide(x, sums, out=np.zeros_like(x), where=sums != 0))
+        return arrays, failed, round(time.time() - t0, 2)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+def build_fingerprints(smiles: list) -> tuple:
+    """自动生成并归一化四类指纹；返回 (arrays, warnings, failed)。"""
+    arrays, failed, elapsed = generate_fingerprints(smiles)
+    warnings = [f'四类指纹由 PaDEL 自动生成（默认参数），用时 {elapsed:.1f} 秒。']
+    if failed:
+        warnings.append(f'{len(failed)} 个分子的指纹生成失败，这些行不参与预测。')
+    return arrays, warnings, failed
 
 def analyze_fingerprints(payload: dict, row: int, task: str) -> dict:
     """Single-row input-zero ablation; caller holds INFERENCE_LOCK.
@@ -135,30 +185,30 @@ def analyze_fingerprints(payload: dict, row: int, task: str) -> dict:
     frame = _read_csv_bytes(base64.b64decode(payload['csv']['b64']))
     if not 0 <= row < len(frame) or len(frame) > MAX_ROWS:
         raise ValueError('分子行号超出范围')
-    build_fingerprints(payload['fingerprints'], len(frame))
-    def encode(frame):
-        return {'b64': base64.b64encode(frame.to_csv(index=False).encode('utf-8')).decode('ascii')}
-    single = {'csv': encode(frame.iloc[[row]]), 'fingerprints': {}, 'tasks': [task]}
-    pieces = {}
-    for key, _, _ in FINGERPRINTS:
-        fp = _read_csv_bytes(base64.b64decode(payload['fingerprints'][key]['b64'])).iloc[[row]].copy()
-        if 'Name' in fp:
-            fp['Name'] = 'AUTOGEN_smi_1'
-        pieces[key] = fp
-        single['fingerprints'][key] = encode(fp)
-    def score(data):
-        result = run_predict(data)
+    lower = {str(c).lower(): c for c in frame.columns}
+    smi_col = lower.get('smiles')
+    if smi_col is None:
+        raise ValueError('分子 CSV 必须包含 smiles 列')
+    smi = '' if frame.iloc[row][smi_col] is None else str(frame.iloc[row][smi_col])
+    arrays, failed, _ = generate_fingerprints([smi])
+    if 0 in failed:
+        raise ValueError(f'该分子无法生成指纹：{failed[0]}')
+    single = {'csv': {'b64': base64.b64encode(
+                  frame.iloc[[row]].to_csv(index=False).encode('utf-8')).decode('ascii')},
+              'tasks': [task]}
+
+    def score(fps):
+        result = run_predict(single, fps_override=fps)
         if result['summary']['ok'] != 1:
             raise ValueError('该分子无法预测，不能进行指纹分析')
         return float(pd.read_csv(io.BytesIO(result['csv_bytes']))[task + '_probability'].iloc[0])
-    baseline = score(single)
+
+    baseline = score(arrays)
     records = []
-    for key, label, _ in FINGERPRINTS:
-        masked = pieces[key].copy()
-        cols = [c for c in masked if c != 'Name']
-        masked.loc[:, cols] = 0
-        altered = {**single, 'fingerprints': {**single['fingerprints'], key: encode(masked)}}
-        value = score(altered)
+    for index, (key, label, _) in enumerate(FINGERPRINTS):
+        masked = [a.copy() for a in arrays]
+        masked[index][0, :] = 0
+        value = score(masked)
         delta = baseline - value
         records.append({'分子序号': row + 1, '任务': task, '指纹': label,
                         '原始分数': baseline, '屏蔽后分数': value,
@@ -167,8 +217,11 @@ def analyze_fingerprints(payload: dict, row: int, task: str) -> dict:
             'method': 'input_zero_ablation'}
 
 
-def run_predict(payload: dict) -> dict:
-    """执行预测，返回可直接 JSON 化的结果结构。"""
+def run_predict(payload: dict, fps_override=None) -> dict:
+    """执行预测，返回可直接 JSON 化的结果结构。
+
+    fps_override 仅供指纹影响分析使用：直接传入已生成的指纹矩阵，跳过自动生成。
+    """
     t0 = time.time()
     all_tasks = _state['task_names']
 
@@ -204,9 +257,13 @@ def run_predict(payload: dict) -> dict:
         raise ValueError('分子 CSV 没有任何数据行')
 
     if n > MAX_ROWS:
-        raise ValueError(f'云端版每次最多 {MAX_ROWS} 个分子，请分批上传。')
+        raise ValueError(f'本地版每次最多 {MAX_ROWS} 个分子，请分批上传。')
 
-    fps, warnings = build_fingerprints(payload.get('fingerprints') or {}, n)
+    if fps_override is not None:
+        fps, warnings, fp_failed = fps_override, [], {}
+    else:
+        fps, warnings, fp_failed = build_fingerprints(
+            ['' if s is None else str(s) for s in df[smi_col].tolist()])
 
     # ---- 逐分子构图，记录无效原因 ----
     lookup = _state['qm9_lookup']
@@ -216,6 +273,11 @@ def run_predict(payload: dict) -> dict:
 
     for i, smi in enumerate(df[smi_col].tolist()):
         smi = '' if smi is None else str(smi)
+        if i in fp_failed:
+            reason = f'指纹自动生成失败：{fp_failed[i]}'
+            failures.append({'row': i, 'smiles': smi, 'reason': reason})
+            rows.append({'row': i, 'smiles': smi, 'status': reason, 'valid': False})
+            continue
         reason = None
         try:
             mol = Chem.MolFromSmiles(smi)

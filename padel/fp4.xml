@@ -1,0 +1,16 @@
+<Root>
+    <Group name="Fingerprint">
+        <Descriptor name="Fingerprinter" value="true"/>
+        <Descriptor name="ExtendedFingerprinter" value="false"/>
+        <Descriptor name="EStateFingerprinter" value="false"/>
+        <Descriptor name="GraphOnlyFingerprinter" value="true"/>
+        <Descriptor name="MACCSFingerprinter" value="false"/>
+        <Descriptor name="PubchemFingerprinter" value="true"/>
+        <Descriptor name="SubstructureFingerprinter" value="false"/>
+        <Descriptor name="SubstructureFingerprintCount" value="false"/>
+        <Descriptor name="KlekotaRothFingerprinter" value="false"/>
+        <Descriptor name="KlekotaRothFingerprintCount" value="false"/>
+        <Descriptor name="AtomPairs2DFingerprinter" value="true"/>
+        <Descriptor name="AtomPairs2DFingerprintCount" value="false"/>
+    </Group>
+</Root>
