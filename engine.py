@@ -76,8 +76,14 @@ def load_assets() -> None:
         electronic_scale=np.array(prep['electronic_scale'], dtype=np.float32),
     )
 
+def _ensure_loaded() -> None:
+    """脚本热更新后模块状态可能被重置，缓存命中时补一次加载。"""
+    if 'model' not in _state:
+        load_assets()
+
 def task_config() -> list:
     """返回全部呼吸毒性任务及其阈值与留出集指标。"""
+    _ensure_loaded()
     out = []
     for i, name in enumerate(_state['task_names']):
         m = _state['metrics'].get(name, {})
@@ -189,6 +195,7 @@ def analyze_fingerprints(payload: dict, row: int, task: str) -> dict:
     This is sensitivity to a zero baseline, not gate weights or causal attribution.
     Never mutate the original payload or shared model.
     """
+    _ensure_loaded()
     if task not in _state['task_names']:
         raise ValueError('未知预测任务')
     frame = _read_csv_bytes(base64.b64decode(payload['csv']['b64']))
@@ -231,6 +238,7 @@ def run_predict(payload: dict, fps_override=None) -> dict:
 
     fps_override 仅供指纹影响分析使用：直接传入已生成的指纹矩阵，跳过自动生成。
     """
+    _ensure_loaded()
     t0 = time.time()
     all_tasks = _state['task_names']
 
