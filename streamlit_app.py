@@ -36,9 +36,9 @@ def clear_analysis():
 def encode_file(file):
     return {'name':file.name,'b64':base64.b64encode(file.getvalue()).decode('ascii')}
 
-st.caption('GFENet  /  多任务分子预测')
+st.caption('GFENet  /  多任务分子预测（本地免指纹版）')
 st.title('呼吸毒性预测工作台')
-st.write('上传分子与配套指纹，选择关注方向，获得可下载的多任务预测结果。')
+st.write('只上传分子 CSV，四类指纹由服务端用 PaDEL 自动生成，选择关注方向即可获得可下载的多任务预测结果。')
 st.info('研究用途：输出是模型分数和阈值分类，不是人体患病概率，也不能证明分子安全。模型尚未经过外部数据验证。')
 try:
     with st.spinner('正在加载模型…'):
@@ -64,23 +64,14 @@ st.subheader('1 · 准备输入')
 mode=st.radio('输入方式',['使用真实测试样例','上传自己的文件'],horizontal=True,on_change=clear_result)
 uploads={}
 if mode=='使用真实测试样例':
-    st.success('已准备 1 个真实测试分子及配套指纹。点击“开始预测”即可体验。')
+    st.success('已准备 1 个真实测试分子。点击“开始预测”即可体验自动生成指纹的流程。')
     st.caption('这是既有留出测试样例，不是新开展的外部验证。')
-    archive=io.BytesIO()
-    with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
-        for filename in ['input.csv','pubchem.csv','graph.csv','apc2d.csv','fp1024.csv']:
-            z.write(engine.EXAMPLE_DIR/filename,filename)
-    st.download_button('下载示例输入文件',archive.getvalue(),'gfenet_example.zip','application/zip')
 else:
-    st.write('分子 CSV 需有 `smiles` 列。四类指纹必须与分子逐行对应，算法和参数必须与训练时一致。')
+    st.write('分子 CSV 只需包含 `smiles` 列。四类指纹会在预测时自动生成，无需上传。')
     uploads['csv']=st.file_uploader('分子列表 CSV',type=['csv'],key='molecules',on_change=clear_result)
-    columns=st.columns(2)
-    for i,(key,label,_) in enumerate(engine.FINGERPRINTS):
-        with columns[i%2]:
-            uploads[key]=st.file_uploader(label,type=['csv'],key=key,on_change=clear_result)
-    st.caption('指纹若含 Name 列，编号须为 AUTOGEN_smi_1 起的连续编号。单个文件最大 5 MB。当前不支持仅凭 SMILES 自动生成四类指纹。')
+    st.caption('自动生成使用 PaDEL-Descriptor v2.21 默认参数（Pubchem 881 / GraphOnly 1024 / AtomPairs2D 780 / Fingerprinter 1024），与训练指纹逐位一致。单个文件最大 5 MB。')
 
-ready=bool(selected) and (mode=='使用真实测试样例' or all(uploads.values()))
+ready=bool(selected) and (mode=='使用真实测试样例' or uploads.get('csv'))
 if st.button('开始预测',type='primary',disabled=not ready):
     clear_result()
     acquired=engine.INFERENCE_LOCK.acquire(blocking=False)
@@ -89,7 +80,7 @@ if st.button('开始预测',type='primary',disabled=not ready):
     else:
         try:
             example=engine.example_payload() if mode=='使用真实测试样例' else {k:encode_file(v) for k,v in uploads.items()}
-            payload={'csv':example['csv'],'fingerprints':{k:example[k] for k,_,_ in engine.FINGERPRINTS},'tasks':selected}
+            payload={'csv':example['csv'],'tasks':selected}
             with st.spinner('正在检查文件、构建分子图并预测，请稍候…'):
                 result=engine.run_predict(payload)
             st.session_state['prediction_result']=result
