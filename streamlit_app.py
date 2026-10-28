@@ -87,8 +87,8 @@ if st.button('开始预测',type='primary',disabled=not ready):
             st.session_state['prediction_payload']=payload
         except ValueError as exc:
             st.error(str(exc))
-        except Exception:
-            st.error('预测未完成。请检查输入文件，或联系部署者查看服务日志。')
+        except Exception as exc:
+            st.error(f'预测未完成（{type(exc).__name__}）：{exc}')
         finally:
             engine.INFERENCE_LOCK.release()
 

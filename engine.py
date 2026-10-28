@@ -93,15 +93,18 @@ def task_config() -> list:
     return out
 
 def _java_path() -> str:
-    """定位 Java：环境变量 PADEL_JAVA > 常见本机运行时 > PATH。"""
-    for candidate in (os.environ.get('PADEL_JAVA'),
-                      r'C:\Program Files\JetBrains\PyCharm 2025.3.2\jbr\bin\java.exe'):
+    """定位 Java：环境变量 PADEL_JAVA > 常见系统路径 > PATH（兼容 Linux 容器）。"""
+    candidates = [os.environ.get('PADEL_JAVA'),
+                  r'C:\Program Files\JetBrains\PyCharm 2025.3.2\jbr\bin\java.exe',
+                  '/usr/bin/java', '/usr/local/bin/java']
+    candidates += sorted(str(p) for p in Path('/usr/lib/jvm').glob('*/bin/java'))
+    for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return candidate
     found = shutil.which('java')
     if found:
         return found
-    raise ValueError('未找到 Java 运行时：请安装 JRE，或设置环境变量 PADEL_JAVA 指向 java.exe')
+    raise ValueError('未找到 Java 运行时：请安装 JRE，或设置环境变量 PADEL_JAVA 指向 java 可执行文件')
 
 def _padel_columns(columns, prefix: str, width: int, label: str) -> list:
     cols = [c for c in columns if str(c).startswith(prefix) and c != 'Name']
@@ -131,10 +134,16 @@ def generate_fingerprints(smiles: list) -> tuple:
         # 不写分子名 -> PaDEL 生成 AUTOGEN_smi_1..N，与训练指纹的命名规则一致
         (in_dir / 'smi.smi').write_text('\n'.join(smiles) + '\n', encoding='utf-8')
         out_csv = work / 'out.csv'
-        cmd = [_java_path(), '-Xmx512m', '-jar', str(PADEL_JAR), '-fingerprints',
+        cmd = [_java_path(), '-Djava.awt.headless=true', '-Xmx512m', '-jar', str(PADEL_JAR),
+               '-fingerprints',
                '-descriptortypes', str(PADEL_XML), '-dir', str(in_dir),
                '-file', str(out_csv), '-retainorder']
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except FileNotFoundError as exc:
+            raise ValueError(f'Java 无法执行：{exc}')
+        except subprocess.TimeoutExpired:
+            raise ValueError('PaDEL 运行超时（超过 600 秒），请减少单次分子数')
         if not out_csv.is_file():
             detail = (proc.stdout + proc.stderr).strip()[-500:]
             raise ValueError(f'PaDEL 未生成输出文件：{detail}')
